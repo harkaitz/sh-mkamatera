@@ -1,0 +1,355 @@
+#!/bin/bash -e
+#L:
+#L:  MIT License
+#L:  
+#l:  Bug reports, feature requests to gemini|https://harkadev.com/oss
+#l:  Copyright (c) 2022 Harkaitz Agirre, harkaitz.aguirre@gmail.com
+#L:
+#L:  Permission is hereby granted, free of charge, to any person obtaining
+#L:  a copy of this software and associated documentation files (the
+#L:  "Software"), to deal in the Software without restriction, including
+#L:  without limitation the rights to use, copy, modify, merge, publish,
+#L:  distribute, sublicense, and/or sell copies of the Software, and to
+#L:  permit persons to whom the Software is furnished to do so, subject to
+#L:  the following conditions:
+#L:
+#L:  The above copyright notice and this permission notice shall be
+#L:  included in all copies or substantial portions of the Software.
+#L:
+#L:  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+#L:  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+#L:  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+#L:  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+#L:  LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#L:  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+#L:  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+##:
+#h: Usage: $0 ...
+#h:
+#h: ... show                  : Show configuration.
+#h: ... ls                    : List servers.
+#h: ... ls-o OPTS...          : List options.
+#h:     | billing cpu         |
+#h:     | datacenter image    |
+#h:     | network ram traffic |
+#h: ... create NAME           : Create machine.
+#h: ... tasks                 : See recent commands.
+#h: ... uuid   NAME|UUID      : Get UUID of a machine.
+#h: ... billing [MONTH] [YEAR]: Print usage info.
+#h: ... password              : Get main password.
+#h: ... p-hosts               : Print /etc/hosts for kamatera servers.
+#h: ... p-ssh_config          : Print /etc/ssh/ssh_config for kamatera servers.
+#h: ... u-locals              : Update /etc/hosts, /etc/ssh/ssh_config.
+#h:
+#h: ... NAME|UUID power on|off|restart : Set power state.
+#h: ... NAME|UUID ipaddr               : Get IP address.
+#h: ... NAME|UUID rename NAME          : Rename machine.
+#h: ... NAME|UUID attach               : Open terminal.
+#h: ... NAME|UUID resetpass            : Change password.
+#h: ... NAME|UUID sshkey               : Upload ssh key.
+. hlog
+. hfile
+. hmain
+mkamatera() {
+    local cmd="$1" uuid=''
+    shift
+    mkamatera_check_programs
+    case "${cmd}" in
+        show)         mkamatera_show_variables   ;;
+        ls)           mkamatera_ls      "$@"     ;;
+        ls-o)         mkamatera_ls_o    "$@"     ;;
+        create)       mkamatera_create  "$@"     ;;
+        tasks)        mkamatera_tasks   "$@"     ;;
+        uuid)         mkamatera_uuid    "$@"     ;;
+        billing)      mkamatera_billing "$@"     ;;
+        password)     mkamatera_password         ;;
+        p-hosts)      mkamatera_print_hosts      ;;
+        p-ssh_config) mkamatera_print_ssh_config ;;
+        u-locals)     mkamatera_u_locals         ;;
+        *)            uuid="`mkamatera_uuid "${cmd}"`"
+                      if test ! -n "${uuid}"; then
+                          return 1
+                      fi
+                      if test -n "${1}"; then
+                          cmd="${1}"
+                          shift
+                      else
+                          cmd="info"
+                      fi
+                      mkamatera_"${cmd}" "${uuid}" "$@"
+                      ;;
+    esac
+}
+mkamatera_show_variables() {
+    printf '%-30s : %s\n'                                 \
+           KAMATERA_CACHE       "${KAMATERA_CACHE}"       \
+           KAMATERA_DATACENTER  "${KAMATERA_DATACENTER}"  \
+           KAMATERA_SERVER_PASS "${KAMATERA_SERVER_PASS}" \
+           KAMATERA_BILLING     "${KAMATERA_BILLING}"     \
+           KAMATERA_IMG         "${KAMATERA_IMG}"         \
+           KAMATERA_CPU         "${KAMATERA_CPU}"         \
+           KAMATERA_RAM         "${KAMATERA_RAM}"         \
+           KAMATERA_GBS         "${KAMATERA_GBS}"
+}
+mkamatera_calc_variables() {
+    KAMATERA_CACHE="${KAMATERA_CACHE:-${HOME}/.local/cache}"
+    KAMATERA_DATACENTER="${KAMATERA_DATACENTER:-EU}"
+    KAMATERA_SERVER_PASS="${KAMATERA_SERVER_PASS:-}"
+    KAMATERA_BILLING="${KAMATERA_BILLING:-monthly}"
+    KAMATERA_IMG="${KAMATERA_IMG:-}"
+    KAMATERA_TRAFFIC="${KAMATERA_TRAFFIC:-3}"
+    mkamatera_calc_variables_small
+}
+mkamatera_calc_variables_small() {
+    KAMATERA_CPU="${KAMATERA_P1_CPU:-1A}"
+    KAMATERA_RAM="${KAMATERA_P1_RAM:-2048}"
+    KAMATERA_GBS="${KAMATERA_P1_GBS:-20}"
+}
+mkamatera_calc_variables_large() {
+    KAMATERA_CPU="${KAMATERA_P2_CPU:-2B}"
+    KAMATERA_RAM="${KAMATERA_P2_RAM:-4096}"
+    KAMATERA_GBS="${KAMATERA_P2_GBS:-30}"
+}
+mkamatera_check_programs() {
+    local ret='0'
+    if ! which jq >/dev/null 2>&1; then
+        hlog error "Please install 'jq'."
+        ret='1'
+    fi
+    if ! which csv2rec rec2csv >/dev/null 2>&1; then
+        hlog error "Please install 'recutils'."
+        ret='1'
+    fi
+    if ! which cloudcli >/dev/null 2>&1; then
+        hlog error "Please install 'cloudcli'."
+        ret='1'
+    fi
+    if ! which curl >/dev/null 2>&1; then
+        hlog error "Please install 'curl'."
+        ret='1'
+    fi
+    return "${ret}"
+}
+## -----------------------------------------------------------------------------
+mkamatera_ls() {
+    kamatera_curl_STDOUT "https://console.kamatera.com/service/servers" \
+        | jq -r '.[] | .id + " " + .datacenter + " " + .name + " " + .power'
+}
+mkamatera_ls_o() {
+    local f='' o='' opts='
+    billing cpu datacenter image
+    network ram traffic
+    '
+    mkdir -p "${KAMATERA_CACHE}"
+    for o in "$@"; do
+        f="${KAMATERA_CACHE}/kamatera-${o}.lst"
+        if test ! -e "${f}"; then
+            hlog info "Downloading Kamatera ${o} options ..."
+            kamatera_cloudcli server options --"${o}" > "${f}.tmp"
+            mv "${f}.tmp" "${f}"
+        fi
+        cat "${f}"
+    done
+}
+mkamatera_password() {
+    local password="`${KAMATERA_SERVER_PASS}`"
+    if test -n "${password}"; then
+        printf '%s\n' "${password}"
+        return 0
+    else
+        hlog error "Can't get the password exexuting KAMATERA_SERVER_PASS."
+        hlog error "Command: ${KAMATERA_SERVER_PASS}"
+        return 1
+    fi
+}
+mkamatera_create() {
+    ## Get name.
+    if test "$(echo -n "${1}" | wc -c)" -gt 4; then
+        local name="${1}"
+    else
+        hlog error "Please specify a name with at least 4 characters."
+        return 1
+    fi
+    ## Get password.
+    local password="`mkamatera_password`"
+    if test ! -n "${password}"; then
+        return 1
+    fi
+    kamatera_curl_JSON                         \
+        "https://console.kamatera.com/service/server" \
+        -X POST                                \
+        -d datacenter="${KAMATERA_DATACENTER}" \
+        -d billing="${KAMATERA_BILLING}"       \
+        -d managed="0" `: 40USD`               \
+        -d backup="0"  `: 3USD `               \
+        -D power="0"                           \
+        `: Name and password.`                 \
+        -d name="${name}"                      \
+        -d password="${password}"              \
+        `: System configuration.`              \
+        -d cpu="${KAMATERA_CPU}"               \
+        -d ram="${KAMATERA_RAM}"               \
+        -d disk_size_0="${KAMATERA_GBS}"       \
+        -d disk_src_0="${KAMATERA_IMG}"        \
+        `: Networking.`                        \
+        -d network_name_0="wan"                \
+        -d traffic="${KAMATERA_TRAFFIC}"
+}
+mkamatera_tasks() {
+    kamatera_curl_STDOUT "https://console.kamatera.com/service/queue" | less
+}
+mkamatera_uuid() {
+    local uuid=''
+    case "${1}" in
+        '')
+            hlog error "Please specify a name or UUID."
+            return 1
+            ;;
+        *-*-*-*-*)
+            printf '%s\n' "${1}"
+            return 0
+            ;;
+        *)
+            kamatera_curl_JSON "https://console.kamatera.com/service/servers"
+            uuid="`jq -r '.[] | select(.name=="'"${1}"'") | .id' <<< "${JSON}"`"
+            if test -n "${uuid}"; then
+                printf '%s\n' "${uuid}"
+                return 0
+            else
+                hlog error "Machine '${1}' not found."
+                return 1
+            fi
+            ;;
+    esac
+}
+mkamatera_billing() {
+    local m="${1:-`date +%m`}" y="${2:-`date +%Y`}"
+    local f="${KAMATERA_CACHE}/${y}-${m}.csv"
+    if test ! -e "${f}"; then
+        kamatera_curl_STDOUT \
+            "https://console.kamatera.com/service/billing/${y}/${m}/self" \
+            | csv2rec | rec2csv > "${f}"
+    fi
+    echo "${f}"
+    return 0
+}
+mkamatera_print_hosts() {
+    local uuid='' datacenter='' name='' ign='' ip=''
+    mkamatera_ls | while read uuid datacenter name ign; do
+        kamatera_curl_JSON \
+            "https://console.kamatera.com/service/server/${uuid}"
+        ip="$(jq -r '.networks[0].ips[0]' <<< "${JSON}")"
+        printf '%-20s %s\n' "${ip}" "${name}"
+    done
+}
+mkamatera_print_ssh_config() {
+    local uuid='' datacenter='' name='' ign=''
+    mkamatera_ls | while read uuid datacenter name ign; do
+        kamatera_curl_JSON \
+            "https://console.kamatera.com/service/server/${uuid}"
+        ip="$(jq -r '.networks[0].ips[0]' <<< "${JSON}")"
+        sed 's/^|//' <<-EOF
+	|Host ${name}
+	|	HostName     ${ip}
+	|	Port         22
+	|	User         root
+	|	IdentityFile ${HOME}/.ssh/id_rsa
+	EOF
+    done
+}
+mkamatera_u_locals() {
+    hlog info "Adding kamatera servers to /etc/hosts ..."
+    mkamatera_print_hosts | hfile fadd sudo /etc/hosts KAMATERA
+    hlog info "Adding kamatera servers to /etc/ssh/ssh_config ..."
+    mkamatera_print_ssh_config | hfile fadd sudo /etc/ssh/ssh_config KAMATERA
+}
+## -----------------------------------------------------------------------------
+mkamatera_info() {
+    kamatera_curl_STDOUT \
+        "https://console.kamatera.com/service/server/${1}"
+    echo ""
+}
+mkamatera_ipaddr() {
+    local JSON=''
+    kamatera_curl_JSON \
+        "https://console.kamatera.com/service/server/${1}"
+    jq -r '.networks[0].ips[0]' <<< "${JSON}"
+}
+
+mkamatera_power() {
+    local uuid="$1" state="$2"
+    case "${state}" in
+        on|off|restart) true;;
+        '')             hlog error "Please specify new state.";  return 1;;
+        *)              hlog error "Invalid argument: ${state}."; return 1;;
+    esac
+    kamatera_curl_STDOUT                                            \
+        "https://console.kamatera.com/service/server/${uuid}/power" \
+        -X PUT                                                      \
+        -d power="${state}"
+    echo ''
+}
+mkamatera_rename() {
+    local uuid="$1"
+    if test "$(echo -n "${2}" | wc -c)" -gt 4; then
+        local name="${2}"
+    else
+        hlog error "Please specify a name with at least 4 characters."
+        return 1
+    fi
+    kamatera_curl_STDOUT                                             \
+        "https://console.kamatera.com/service/server/${uuid}/rename" \
+        -X PUT                                                       \
+        -d name="${name}" 
+}
+mkamatera_attach() {
+    local password="`mkamatera_password`"
+    test -n "${password}"
+    kamatera_cloudcli server attach --id "${uuid}" --password "${password}"
+}
+mkamatera_resetpass() {
+    local uuid="${1}"
+    local password="`mkamatera_password`"
+    test -n "${password}"
+    kamatera_curl_STDOUT                                               \
+        "https://console.kamatera.com/service/server/${uuid}/password" \
+        -X PUT                                                         \
+        -d password="${password}"
+    echo ""
+}
+mkamatera_sshcopy() {
+    local password="$(mkamatera_password)"
+    test -n "${password}"
+    local ipaddr="$(mkamatera_ipaddr "${1}")"
+    test -n "${ipaddr}"
+    sshpass -p "${password}" ssh-copy-id "root@${ipaddr}"
+}
+## -----------------------------------------------------------------------------
+kamatera_curl_STDOUT() {
+    curl -s                                           \
+         -H "AuthClientId: ${KAMATERA_API_CLIENT_ID}" \
+         -H "AuthSecret: ${KAMATERA_API_SECRET}"      \
+         "$@"
+}
+kamatera_curl_JSON() {
+    local err=''
+    JSON="$(kamatera_curl_STDOUT "$@")"
+    if test ! -n "${JSON}"; then
+        hlog error "Empty response from kamatera."
+        return 1
+    fi
+    err="$(jq '.errors' <<< "${JSON}" 2>/dev/null || true)"
+    if test ! @"${err:-null}" = @"null"; then
+        hlog error "$(jq -r '.[0].info' <<< "${err}")"
+        return 1
+    fi
+}
+kamatera_cloudcli() {
+    cloudcli                                       \
+        --api-clientid="${KAMATERA_API_CLIENT_ID}" \
+	--api-secret="${KAMATERA_API_SECRET}"      \
+	"$@"
+}
+## -----------------------------------------------------------------------------
+mkamatera_calc_variables
+hmain -f "mkamatera" -s "bash" mkamatera "$@"
